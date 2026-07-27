@@ -56,7 +56,7 @@ export class Runtime {
   ready = false;
 
   _rotateFromWorldCenter: boolean = false;
-  viewportCenterPoint: { x: number; y: number; };
+  viewportCenterPoint: { x: number; y: number; } = { x: 0, y: 0 };
   viewport: { x: number; y: number; width: number; height: number; top: number; left: number; } | undefined;
   // Helper getters.
   get x(): number {
@@ -64,7 +64,6 @@ export class Runtime {
   }
 
   set x(x: number) {
-    console.log('set x', x);
     this.target[1] = x;
   }
 
@@ -73,7 +72,6 @@ export class Runtime {
   }
 
   set y(y: number) {
-    console.log('set y', y);
     this.target[2] = y;
   }
 
@@ -82,7 +80,6 @@ export class Runtime {
   }
 
   set x2(x2: number) {
-    console.log('set x2', x2);
     this.target[3] = x2;
   }
 
@@ -91,7 +88,6 @@ export class Runtime {
   }
 
   set y2(y2: number) {
-    console.log('set y2', y2);
     this.target[4] = y2;
   }
 
@@ -100,7 +96,6 @@ export class Runtime {
   }
 
   set width(width: number) {
-    console.log('set width', width);
     this.target[3] = this.target[1] + width;
   }
 
@@ -118,8 +113,60 @@ export class Runtime {
   }
 
   set rotateFromWorldCenter(rotateFromWorldCenter: boolean) {
-    console.log('setRotateFromWorldCenter', rotateFromWorldCenter)
+    if (rotateFromWorldCenter === this._rotateFromWorldCenter) {
+      return;
+    }
+    this.compensateRotationPivotChange(rotateFromWorldCenter);
     this._rotateFromWorldCenter = rotateFromWorldCenter;
+  }
+
+  /**
+   * Switching the rotation pivot (own-center vs. viewport-center) for an object
+   * that already has a non-zero rotation would otherwise cause it to jump, since
+   * the same angle drawn around a different point lands the shape somewhere else.
+   * This nudges each rotated world-object's position so the pivot switch is seamless:
+   * whatever is on screen right now stays there, and only future rotation changes
+   * pivot around the newly selected anchor.
+   */
+  private compensateRotationPivotChange(switchingToViewportCenter: boolean) {
+    if (!this.viewport) {
+      return;
+    }
+
+    this.viewport = this.getRendererScreenPosition();
+    this.updateViewportCenterPoint();
+
+    const scaleFactor = this.getScaleFactor();
+    const vc = this.viewportCenterPoint;
+    // Going to viewport-center pivot: undo the angle around vc (R(-angle)).
+    // Going back to own-center pivot: re-apply it (R(angle)).
+    const sign = switchingToViewportCenter ? -1 : 1;
+
+    for (const owner of this.world.layers) {
+      if (!owner.rotation) {
+        continue;
+      }
+
+      const screen = this.worldToViewer(owner.x, owner.y, owner.width, owner.height);
+      const px = screen.x + screen.width / 2;
+      const py = screen.y + screen.height / 2;
+      const dx = px - vc.x;
+      const dy = py - vc.y;
+      const angle = (sign * owner.rotation * Math.PI) / 180;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const newPx = vc.x + (dx * cos - dy * sin);
+      const newPy = vc.y + (dx * sin + dy * cos);
+
+      const worldDx = (newPx - px) / scaleFactor;
+      const worldDy = (newPy - py) / scaleFactor;
+
+      if (worldDx || worldDy) {
+        owner.translate(worldDx, worldDy);
+      }
+    }
+
+    this.pendingUpdate = true;
   }
 
 
@@ -212,9 +259,17 @@ export class Runtime {
     this.render(this.lastTime);
     this.startControllers();
     this.viewport = this.getRendererScreenPosition();
+    this.updateViewportCenterPoint();
+  }
 
-    this.viewportCenterPoint = this.viewerToWorld((this.viewport?.width || 0) /2, (this.viewport?.height || 0) /2 );
-    console.log({x: this.target[1], y:this.target[2]})
+  updateViewportCenterPoint() {
+    // The rotation pivot is applied directly against viewer/screen-space
+    // coordinates in the renderer (see applyTransform), so this must stay
+    // in that same space rather than being converted to world coordinates.
+    this.viewportCenterPoint = {
+      x: (this.viewport?.width || 0) / 2,
+      y: (this.viewport?.height || 0) / 2,
+    };
   }
 
 
@@ -919,14 +974,10 @@ export class Runtime {
     const points = this.renderer.getPointsAt(this.world, this.target, this.aggregate, scaleFactor);
     const pointsLen = points.length;
 
-    console.log('prepareLayer', {
-      rotateFromWorldCenter: this.rotateFromWorldCenter, viewportCenterPoint: this.viewportCenterPoint, width: this.width, height: this.height, world: {
-        width: this.world.width,
-        height: this.world.height
-      }, viewport: this.viewport,
-      target: this.target
+    if (this.rotateFromWorldCenter) {
+      this.viewport = this.getRendererScreenPosition();
+      this.updateViewportCenterPoint();
     }
-    );
 
     for (let p = 0; p < pointsLen; p++) {
       // each point is an array of [SpacialContent, Strand, Strand]

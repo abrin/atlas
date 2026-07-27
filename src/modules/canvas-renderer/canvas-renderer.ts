@@ -1,5 +1,5 @@
 import { Strand } from '@atlas-viewer/dna';
-import { Paint, Paintable, WorldObject, rotatePoint } from '../../world-objects';
+import { Paint, Paintable, WorldObject } from '../../world-objects';
 import { PositionPair } from '../../types';
 import { distance } from '../../utils';
 import { Text } from '../../objects/text';
@@ -371,22 +371,16 @@ export class CanvasRenderer implements Renderer {
       const halfHeight = height / 2;
       const angle = (owner.rotation * Math.PI) / 180;
       // cx/cy only sent in if there's a unique rotation point
-      if (cy == undefined || cy == undefined) {
+      if (cx == undefined || cy == undefined) {
         const moveX = x + halfWidth;
         const moveY = y + halfHeight;
         this.ctx.translate(moveX, moveY);
         this.ctx.rotate(angle);
         this.ctx.translate(-moveX, -moveY);
-      } else  {
-        const moveX = cx - halfWidth;
-        const moveY = cy - halfHeight;
+      } else {
         this.ctx.translate(cx, cy);
         this.ctx.rotate(angle);
-        const target: number[] = rotatePoint(moveX, moveY, x, y, owner.rotation);
-        let nMoveX = target[0]+ halfWidth;
-        let nMoveY = target[1] + halfHeight;
-
-        this.ctx.translate(-nMoveX, -nMoveY);
+        this.ctx.translate(-cx, -cy);
       }
       this.lastPaintedObject = owner;
     }
@@ -414,7 +408,6 @@ export class CanvasRenderer implements Renderer {
           moveX -= paint.crop[index * 5 + 1];
           moveY -= paint.crop[index * 5 + 2];
         }
-        console.log('paint!', paint.display.rotation);
         this.ctx.translate(moveX, moveY);
         this.ctx.rotate((paint.display.rotation * Math.PI) / 180);
         this.ctx.translate(-moveX, -moveY);
