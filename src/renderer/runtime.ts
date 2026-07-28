@@ -70,6 +70,9 @@ export class Runtime {
   readyTimestamp: number | undefined;
   resourceTransitionKey: string | number | undefined;
   private hasResourceTransitionKey = false;
+  _rotateFromWorldCenter: boolean = false;
+  viewportCenterPoint: { x: number; y: number } = { x: 0, y: 0 };
+  viewport: { x: number; y: number; width: number; height: number; top: number; left: number } | undefined;
   // Helper getters.
   get x(): number {
     return this.target[1];
@@ -117,6 +120,67 @@ export class Runtime {
 
   set height(height: number) {
     this.target[4] = this.target[2] = height;
+  }
+
+  get rotateFromWorldCenter(): boolean {
+    return this._rotateFromWorldCenter;
+  }
+
+  set rotateFromWorldCenter(rotateFromWorldCenter: boolean) {
+    if (rotateFromWorldCenter === this._rotateFromWorldCenter) {
+      return;
+    }
+    this.compensateRotationPivotChange(rotateFromWorldCenter);
+    this._rotateFromWorldCenter = rotateFromWorldCenter;
+  }
+
+  /**
+   * Switching the rotation pivot (own-center vs. viewport-center) for an object
+   * that already has a non-zero rotation would otherwise cause it to jump, since
+   * the same angle drawn around a different point lands the shape somewhere else.
+   * This nudges each rotated world-object's position so the pivot switch is seamless:
+   * whatever is on screen right now stays there, and only future rotation changes
+   * pivot around the newly selected anchor.
+   */
+  private compensateRotationPivotChange(switchingToViewportCenter: boolean) {
+    if (!this.viewport) {
+      return;
+    }
+
+    this.viewport = this.getRendererScreenPosition();
+    this.updateViewportCenterPoint();
+
+    const scaleFactor = this.getScaleFactor();
+    const vc = this.viewportCenterPoint;
+    // Going to viewport-center pivot: undo the angle around vc (R(-angle)).
+    // Going back to own-center pivot: re-apply it (R(angle)).
+    const sign = switchingToViewportCenter ? -1 : 1;
+
+    for (const owner of this.world.layers) {
+      if (!owner.rotation) {
+        continue;
+      }
+
+      const screen = this.worldToViewer(owner.x, owner.y, owner.width, owner.height);
+      const px = screen.x + screen.width / 2;
+      const py = screen.y + screen.height / 2;
+      const dx = px - vc.x;
+      const dy = py - vc.y;
+      const angle = (sign * owner.rotation * Math.PI) / 180;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const newPx = vc.x + (dx * cos - dy * sin);
+      const newPy = vc.y + (dx * sin + dy * cos);
+
+      const worldDx = (newPx - px) / scaleFactor;
+      const worldDy = (newPy - py) / scaleFactor;
+
+      if (worldDx || worldDy) {
+        owner.translate(worldDx, worldDy);
+      }
+    }
+
+    this.pendingUpdate = true;
   }
 
   renderer: Renderer;
@@ -210,7 +274,19 @@ export class Runtime {
     this.controllers = controllers;
     this.render(this.lastTime);
     this.startControllers();
+    this.viewport = this.getRendererScreenPosition();
+    this.updateViewportCenterPoint();
     this.homePaddingPx = undefined;
+  }
+
+  updateViewportCenterPoint() {
+    // The rotation pivot is applied directly against viewer/screen-space
+    // coordinates in the renderer (see applyTransform), so this must stay
+    // in that same space rather than being converted to world coordinates.
+    this.viewportCenterPoint = {
+      x: (this.viewport?.width || 0) / 2,
+      y: (this.viewport?.height || 0) / 2,
+    };
   }
 
   setHomePosition(position?: Projection) {
@@ -1285,6 +1361,12 @@ export class Runtime {
     // Get the points to render based on this scale factor and the current x,y,w,h in the target buffer.
     const points = this.renderer.getPointsAt(this.world, this.target, this.aggregate, scaleFactor);
     const pointsLen = points.length;
+
+    if (this.rotateFromWorldCenter) {
+      this.viewport = this.getRendererScreenPosition();
+      this.updateViewportCenterPoint();
+    }
+
     for (let p = 0; p < pointsLen; p++) {
       // each point is an array of [SpacialContent, Strand, Strand]
       // The first is used to get real rendering data, like Image URLs etc.
@@ -1306,7 +1388,9 @@ export class Runtime {
         paint,
         paint.__parent && transformation
           ? transform(paint.__parent.crop || paint.__parent.points, transformation)
-          : position
+          : position,
+        this.rotateFromWorldCenter ? this.viewportCenterPoint.x : undefined,
+        this.rotateFromWorldCenter ? this.viewportCenterPoint.y : undefined
       );
       // For loop helps keep this fast, looping through all of the tiles that make up an image.
       // This could be a single point, where len is one.
