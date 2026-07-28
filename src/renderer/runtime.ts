@@ -1,20 +1,24 @@
-import { Projection, RuntimeController, Viewer } from '../types';
-import { World } from '../world';
 import {
+  compose,
   DnaFactory,
+  dna,
   mutate,
+  type Strand,
   scale,
   scaleAtOrigin,
   transform,
-  Strand,
-  dna,
   translate,
-  compose,
 } from '@atlas-viewer/dna';
-import { Renderer } from './renderer';
-import { Paint } from '../world-objects/paint';
-import { TransitionManager } from '../modules/transition-manager/transition-manager';
 import { nanoid } from 'nanoid';
+import type { RuntimeDebugEvent } from '../modules/react-reconciler/devtools/types';
+import type { AtlasReadyResetReason } from '../modules/shared/ready-events';
+import { TransitionManager } from '../modules/transition-manager/transition-manager';
+import type { Projection, RuntimeController, Viewer } from '../types';
+import { easingFunctions } from '../utility/easing-functions';
+import { getZoneConstrainedBounds } from '../utility/get-zone-constrained-bounds';
+import type { World } from '../world';
+import type { Paint } from '../world-objects/paint';
+import type { Renderer } from './renderer';
 
 export type RuntimeHooks = {
   useFrame: Array<(time: number) => void>;
@@ -51,13 +55,24 @@ export type RuntimeOptions = {
   maxUnderZoom: number;
 };
 
+export type RuntimeZoneState = {
+  zoneId: string;
+  exists: boolean;
+  active: boolean;
+  visibleInViewport: boolean;
+};
+
 export class Runtime {
   id = nanoid();
   ready = false;
-
   _rotateFromWorldCenter: boolean = false;
   viewportCenterPoint: { x: number; y: number; } = { x: 0, y: 0 };
   viewport: { x: number; y: number; width: number; height: number; top: number; left: number; } | undefined;
+  readyCycle = 0;
+  readyReason: AtlasReadyResetReason = 'initial';
+  readyTimestamp: number | undefined;
+  resourceTransitionKey: string | number | undefined;
+  private hasResourceTransitionKey = false;
   // Helper getters.
   get x(): number {
     return this.target[1];
@@ -177,6 +192,7 @@ export class Runtime {
   manualHomePosition: boolean;
   manualFocalPosition: boolean;
   focalPosition: Strand;
+  homePaddingPx: number | { left?: number; right?: number; top?: number; bottom?: number } | undefined;
   transitionManager: TransitionManager;
   aggregate: Strand;
   transformBuffer = dna(500);
@@ -195,6 +211,8 @@ export class Runtime {
   maxScaleFactor = 1;
   _viewerToWorld = { x: 0, y: 0 };
   _lastGoodScale = 1;
+  debugFrame = 0;
+  debugSubscribers = new Set<(event: RuntimeDebugEvent) => void>();
   hooks: RuntimeHooks = {
     useFrame: [],
     useBeforeFrame: [],
@@ -229,7 +247,7 @@ export class Runtime {
     this.options = {
       maxOverZoom: 1,
       maxUnderZoom: 1,
-      visibilityRatio: 1.5,
+      visibilityRatio: 1,
       ...(options || {}),
     };
     this.target = DnaFactory.projection(target);
@@ -243,13 +261,15 @@ export class Runtime {
     this.transitionManager = new TransitionManager(this);
     this.aggregate = scale(1);
     this.world.addLayoutSubscriber((type: string) => {
-      if (type === 'repaint') {
+      if (type === 'repaint' || type === 'zone-changed') {
         this.pendingUpdate = true;
       }
       if (type === 'recalculate-world-size') {
         if (!this.manualHomePosition) {
           this.setHomePosition();
           this.goHome();
+        } else {
+          // recalculate world size?
         }
         this.updateFocalPosition();
       }
@@ -260,6 +280,7 @@ export class Runtime {
     this.startControllers();
     this.viewport = this.getRendererScreenPosition();
     this.updateViewportCenterPoint();
+    this.homePaddingPx = undefined;
   }
 
   updateViewportCenterPoint() {
@@ -276,6 +297,15 @@ export class Runtime {
   setHomePosition(position?: Projection) {
     this.homePosition.set(DnaFactory.projection(position ? position : this.world));
     this.pendingUpdate = true;
+  }
+
+  setHomePaddingPx(px?: number | { left?: number; right?: number; top?: number; bottom?: number }) {
+    this.homePaddingPx = px;
+    this.pendingUpdate = true;
+  }
+
+  getHomePaddingPx(): number | { left?: number; right?: number; top?: number; bottom?: number } | undefined {
+    return this.homePaddingPx;
   }
 
   startControllers() {
@@ -337,12 +367,79 @@ export class Runtime {
     this.options = { ...this.options, ...options };
   }
 
-  goHome(options: { cover?: boolean; position?: Strand } = {}) {
-    if (this.world.width <= 0 || this.world.height <= 0) return;
+  setResourceTransitionKey(key: string | number | undefined) {
+    if (!this.hasResourceTransitionKey) {
+      this.hasResourceTransitionKey = true;
+      this.resourceTransitionKey = key;
+      return;
+    }
+    if (this.resourceTransitionKey === key) {
+      return;
+    }
+    this.resourceTransitionKey = key;
+    if (typeof key === 'undefined') {
+      return;
+    }
+    if (this.renderer.resetImageFadeState) {
+      this.renderer.resetImageFadeState();
+    }
+    this.resetReadyState('resource-transition-key-change');
+  }
 
-    const scaleFactor = this.getScaleFactor();
+  /**
+   * Normalize padding input to a consistent per-side format.
+   */
+  private normalizePadding(paddingPx?: number | { left?: number; right?: number; top?: number; bottom?: number }): {
+    left: number;
+    right: number;
+    top: number;
+    bottom: number;
+  } {
+    if (typeof paddingPx === 'number') {
+      return {
+        left: paddingPx,
+        right: paddingPx,
+        top: paddingPx,
+        bottom: paddingPx,
+      };
+    }
+    if (paddingPx) {
+      return {
+        left: paddingPx.left || 0,
+        right: paddingPx.right || 0,
+        top: paddingPx.top || 0,
+        bottom: paddingPx.bottom || 0,
+      };
+    }
+    return { left: 0, right: 0, top: 0, bottom: 0 };
+  }
 
-    const target = options.position
+  /**
+   * Calculate the viewport region that fits the target content within the available
+   * canvas area (accounting for CSS pixel padding).
+   */
+  getHomeTarget(
+    options: {
+      cover?: boolean;
+      position?: Strand;
+      paddingPx?: number | { left?: number; right?: number; top?: number; bottom?: number };
+    } = {}
+  ): { x: number; y: number; width: number; height: number } {
+    // Get actual canvas dimensions in CSS pixels
+    const rendererPosition = this.getRendererScreenPosition();
+    const canvasWidth = rendererPosition?.width || this.width;
+    const canvasHeight = rendererPosition?.height || this.height;
+
+    // Use provided padding or fall back to default homePaddingPx
+    const paddingPx = options.paddingPx !== undefined ? options.paddingPx : this.homePaddingPx;
+    const padding = this.normalizePadding(paddingPx);
+
+    // Calculate available area after padding (in CSS pixels)
+    const availableWidth = Math.max(1, canvasWidth - padding.left - padding.right);
+    const availableHeight = Math.max(1, canvasHeight - padding.top - padding.bottom);
+
+    // Get the target content bounds (what we want to show)
+    const content = options.position
       ? {
           x: options.position[1],
           y: options.position[2],
@@ -356,29 +453,151 @@ export class Runtime {
           height: this.homePosition[4] - this.homePosition[2],
         };
 
-    const width = this.width * scaleFactor;
-    const height = this.height * scaleFactor;
+    // Calculate aspect ratios
+    const availableAspect = availableWidth / availableHeight;
+    const contentAspect = content.width / content.height;
 
-    const widthScale = target.width / width;
-    const heightScale = target.height / height;
-    const ar = width / height;
+    // Determine the world-unit dimensions needed to fit content in available area
+    let viewWidth: number;
+    let viewHeight: number;
+    let viewX: number;
+    let viewY: number;
 
-    if (options.cover ? widthScale > heightScale : widthScale < heightScale) {
-      const fullWidth = ar * target.height;
-      const space = (fullWidth - target.width) / 2;
+    const fitToWidth = options.cover ? contentAspect < availableAspect : contentAspect > availableAspect;
 
-      this.target[1] = Math.round(-space + target.x);
-      this.target[2] = Math.round(target.y);
-      this.target[3] = Math.round(fullWidth - space + target.x);
-      this.target[4] = Math.round(target.height + target.y);
+    if (fitToWidth) {
+      // Content is wider relative to available area - fit to width
+      viewWidth = content.width;
+      viewHeight = content.width / availableAspect;
+      viewX = content.x;
+      viewY = content.y - (viewHeight - content.height) / 2;
     } else {
-      const fullHeight = target.width / ar;
-      const space = (fullHeight - target.height) / 2;
+      // Content is taller relative to available area - fit to height
+      viewHeight = content.height;
+      viewWidth = content.height * availableAspect;
+      viewX = content.x - (viewWidth - content.width) / 2;
+      viewY = content.y;
+    }
 
+    // Now we need to expand the viewport to account for the padding.
+    // The ratio of world units per CSS pixel in the available area:
+    const worldPerCssPixel = viewWidth / availableWidth;
+
+    // Convert padding from CSS pixels to world units
+    const padLeftWorld = padding.left * worldPerCssPixel;
+    const padRightWorld = padding.right * worldPerCssPixel;
+    const padTopWorld = padding.top * worldPerCssPixel;
+    const padBottomWorld = padding.bottom * worldPerCssPixel;
+
+    // Expand the viewport to include padding areas
+    return {
+      x: viewX - padLeftWorld,
+      y: viewY - padTopWorld,
+      width: viewWidth + padLeftWorld + padRightWorld,
+      height: viewHeight + padTopWorld + padBottomWorld,
+    };
+  }
+
+  isViewportAtHome(
+    options: {
+      cover?: boolean;
+      tolerance?: number;
+      target?: Projection;
+    } = {}
+  ): boolean {
+    const { cover = false, tolerance = 1, target = this.getViewport() } = options;
+    const homeTarget = this.getHomeTarget({ cover });
+
+    return (
+      Math.abs(target.x - homeTarget.x) <= tolerance &&
+      Math.abs(target.y - homeTarget.y) <= tolerance &&
+      Math.abs(target.width - homeTarget.width) <= tolerance &&
+      Math.abs(target.height - homeTarget.height) <= tolerance
+    );
+  }
+
+  isViewportAtHomeZoomLevel(
+    options: {
+      cover?: boolean;
+      tolerance?: number;
+      target?: Projection;
+    } = {}
+  ): boolean {
+    const { cover = false, tolerance = 0.05, target = this.getViewport() } = options;
+    const homeTarget = this.getHomeTarget({ cover });
+    const targetScale = this.renderer.getScale(target.width, target.height) || this._lastGoodScale;
+    const homeScale = this.renderer.getScale(homeTarget.width, homeTarget.height) || this._lastGoodScale;
+
+    if (homeScale === 0) {
+      return false;
+    }
+
+    return Math.abs(targetScale / homeScale - 1) <= tolerance;
+  }
+
+  goHome(
+    options: {
+      cover?: boolean;
+      position?: Strand;
+      paddingPx?: number | { left?: number; right?: number; top?: number; bottom?: number };
+    } = {}
+  ) {
+    if (this.world.width <= 0 || this.world.height <= 0) return;
+
+    // Check if we have any padding to apply
+    const paddingPx = options.paddingPx !== undefined ? options.paddingPx : this.homePaddingPx;
+    const padding = this.normalizePadding(paddingPx);
+    const hasPadding = padding.left > 0 || padding.right > 0 || padding.top > 0 || padding.bottom > 0;
+
+    if (hasPadding) {
+      // Use the new padding-aware calculation
+      const target = this.getHomeTarget(options);
       this.target[1] = Math.round(target.x);
-      this.target[2] = Math.round(target.y - space);
+      this.target[2] = Math.round(target.y);
       this.target[3] = Math.round(target.x + target.width);
-      this.target[4] = Math.round(target.y + fullHeight - space);
+      this.target[4] = Math.round(target.y + target.height);
+    } else {
+      // Original behavior without padding
+      const scaleFactor = this.getScaleFactor();
+
+      const target = options.position
+        ? {
+            x: options.position[1],
+            y: options.position[2],
+            width: options.position[3] - options.position[1],
+            height: options.position[4] - options.position[2],
+          }
+        : {
+            x: this.homePosition[1],
+            y: this.homePosition[2],
+            width: this.homePosition[3] - this.homePosition[1],
+            height: this.homePosition[4] - this.homePosition[2],
+          };
+
+      const width = this.width * scaleFactor;
+      const height = this.height * scaleFactor;
+
+      const widthScale = target.width / width;
+      const heightScale = target.height / height;
+      const ar = width / height;
+
+      if (options.cover ? widthScale > heightScale : widthScale < heightScale) {
+        const fullWidth = ar * target.height;
+        const space = (fullWidth - target.width) / 2;
+
+        this.target[1] = Math.round(-space + target.x);
+        this.target[2] = Math.round(target.y);
+        this.target[3] = Math.round(fullWidth - space + target.x);
+        this.target[4] = Math.round(target.height + target.y);
+      } else {
+        const fullHeight = target.width / ar;
+        const space = (fullHeight - target.height) / 2;
+
+        this.target[1] = Math.round(target.x);
+        this.target[2] = Math.round(target.y - space);
+        this.target[3] = Math.round(target.x + target.width);
+        this.target[4] = Math.round(target.y + fullHeight - space);
+      }
     }
     console.log('gohome', [...this.target]);
     this.constrainBounds(this.target);
@@ -534,7 +753,10 @@ export class Runtime {
   };
 
   constrainBounds(target: Strand, { panPadding = 0, ref = false }: { ref?: boolean; panPadding?: number } = {}) {
-    const { minX, maxX, minY, maxY } = this.getBounds({ target, padding: panPadding });
+    const { minX, maxX, minY, maxY } = this.getBounds({
+      target,
+      padding: panPadding,
+    });
 
     let isConstrained = false;
     const constrained = ref ? target : dna(target);
@@ -582,22 +804,11 @@ export class Runtime {
       const zone = this.world.getActiveZone();
 
       if (zone) {
-        const xCon = target[3] - target[1] < zone.points[3] - zone.points[1];
-        const yCon = target[4] - target[2] < zone.points[4] - zone.points[2];
-        return {
-          minX: xCon
-            ? zone.points[1] - padding
-            : zone.points[1] + (zone.points[3] - zone.points[1]) / 2 - (target[3] - target[1]) / 2,
-          maxX: yCon
-            ? zone.points[2] - padding
-            : zone.points[2] + (zone.points[4] - zone.points[2]) / 2 - (target[4] - target[2]) / 2,
-          minY: xCon
-            ? zone.points[3] + padding
-            : zone.points[1] + (zone.points[3] - zone.points[1]) / 2 - (target[3] - target[1]) / 2,
-          maxY: yCon
-            ? zone.points[4] + padding
-            : zone.points[2] + (zone.points[4] - zone.points[2]) / 2 - (target[4] - target[2]) / 2,
-        };
+        zone.recalculateBounds();
+        const zoneBounds = getZoneConstrainedBounds(target, zone.points, padding);
+        if (zoneBounds) {
+          return zoneBounds;
+        }
       }
     }
 
@@ -656,6 +867,85 @@ export class Runtime {
     return scale;
   }
 
+  private copyStrandValues(target: Strand, next: Strand) {
+    target[0] = next[0];
+    target[1] = next[1];
+    target[2] = next[2];
+    target[3] = next[3];
+    target[4] = next[4];
+  }
+
+  private getZoomConstraintState(target: Strand) {
+    const width = target[3] - target[1];
+    const height = target[4] - target[2];
+    const nextScale = this.renderer.getScale(width, height);
+    const scaleFactor = nextScale === 0 ? this._lastGoodScale : nextScale;
+
+    if (nextScale !== 0) {
+      this._lastGoodScale = nextScale;
+    }
+
+    const displayWidth = width * scaleFactor;
+    const displayHeight = height * scaleFactor;
+    const widthScale = this.world.width / displayWidth;
+    const heightScale = this.world.height / displayHeight;
+
+    const minScale =
+      widthScale > heightScale
+        ? (displayWidth * this.options.maxUnderZoom) / this.world.width
+        : (displayHeight * this.options.maxUnderZoom) / this.world.height;
+
+    const sWidth = this.getRendererScreenPosition()?.width;
+    const ratio = sWidth ? sWidth / this.world.width : 1;
+    const maxScale = Math.max(ratio || 1, this.options.maxOverZoom);
+
+    return {
+      scaleFactor,
+      minScale,
+      maxScale,
+    };
+  }
+
+  constrainTarget(
+    target: Strand,
+    {
+      origin,
+      panPadding = 0,
+      ref = false,
+    }: {
+      origin?: { x: number; y: number };
+      panPadding?: number;
+      ref?: boolean;
+    } = {}
+  ) {
+    let isConstrained = false;
+    const constrained = ref ? target : dna(target);
+    const { scaleFactor, minScale, maxScale } = this.getZoomConstraintState(constrained);
+    const clampedScale = Math.max(minScale, Math.min(maxScale, scaleFactor));
+
+    if (Math.abs(clampedScale - scaleFactor) > 0.000001) {
+      const zoomOrigin = origin || {
+        x: constrained[1] + (constrained[3] - constrained[1]) / 2,
+        y: constrained[2] + (constrained[4] - constrained[2]) / 2,
+      };
+      const adjusted = transform(
+        constrained,
+        scaleAtOrigin(scaleFactor / clampedScale, zoomOrigin.x, zoomOrigin.y),
+        this.zoomBuffer
+      );
+
+      this.copyStrandValues(constrained, adjusted);
+      isConstrained = true;
+    }
+
+    const [isPanConstrained] = this.constrainBounds(constrained, {
+      ref: true,
+      panPadding,
+    });
+
+    return [isConstrained || isPanConstrained, constrained] as const;
+  }
+
   /**
    * Zoom
    */
@@ -669,72 +959,40 @@ export class Runtime {
       fromPos?: Strand;
     }
   ) {
-    const fromPos = _fromPos ? { width: _fromPos[3] - _fromPos[1], height: _fromPos[4] - _fromPos[2] } : undefined;
-    // Fresh scale factor.
-    const scaleFactor = fromPos ? this.renderer.getScale(fromPos.width, fromPos.height) : this.getScaleFactor();
-    const w = fromPos ? fromPos.width : this.width;
-    const h = fromPos ? fromPos.height : this.height;
-
-    const sWidth = this.getRendererScreenPosition()?.width;
-    const wWidth = this.world.width;
-    const ratio = sWidth ? sWidth / wWidth : 1;
-
-    const maxUnderZoom = this.options.maxUnderZoom;
-    const maxOverZoom = Math.max(ratio || 1, this.options.maxOverZoom);
+    const source = _fromPos || this.target;
+    const { scaleFactor, minScale, maxScale } = this.getZoomConstraintState(source);
 
     const realFactor = 1 / factor;
-    const proposedFactor = scaleFactor * realFactor;
+    const proposedScale = scaleFactor * realFactor;
     const isZoomingOut = realFactor < 1;
 
     if (isZoomingOut) {
-      const width = w * scaleFactor;
-      const height = h * scaleFactor;
-
-      const widthScale = this.world.width / width;
-      const heightScale = this.world.height / height;
-
-      if (widthScale > heightScale) {
-        // Constrain width
-        // If the proposed world display height.
-        const proposedWorldDisplayWidth = this.world.width * proposedFactor;
-        // Is greater than the display width.
-        const displayWidth = ~~(w * scaleFactor);
-        const displayWidthAdjusted = displayWidth * maxUnderZoom;
-
-        if (proposedWorldDisplayWidth < displayWidthAdjusted) {
-          factor = (this.world.width * scaleFactor) / (w * scaleFactor * maxUnderZoom);
-        }
-      } else {
-        // Constrain height.
-        // If the proposed world display height.
-        const proposedWorldDisplayHeight = this.world.height * proposedFactor;
-        // Is greater than the display height.
-        const displayHeight = ~~(h * scaleFactor);
-        const displayHeightAdjusted = displayHeight * maxUnderZoom;
-
-        if (proposedWorldDisplayHeight < displayHeightAdjusted) {
-          factor = (this.world.height * scaleFactor) / (h * scaleFactor * maxUnderZoom);
-        }
+      if (proposedScale < minScale) {
+        factor = scaleFactor / minScale;
       }
     } else {
       // Zooming in.
-      if (proposedFactor > maxOverZoom) {
-        factor = scaleFactor / maxOverZoom;
+      if (proposedScale > maxScale) {
+        factor = scaleFactor / maxScale;
       }
     }
 
     // set the new scale.
     const proposedStrand = transform(
-      this.target,
+      source,
       scaleAtOrigin(
         factor,
-        origin ? origin.x : this.target[1] + (this.target[3] - this.target[1]) / 2,
-        origin ? origin.y : this.target[2] + (this.target[4] - this.target[2]) / 2
+        origin ? origin.x : source[1] + (source[3] - source[1]) / 2,
+        origin ? origin.y : source[2] + (source[4] - source[2]) / 2
       ),
       this.zoomBuffer
     );
 
-    this.constrainBounds(proposedStrand, { ref: true, panPadding: 100 });
+    const zoomPanPadding = this.world.hasActiveZone() ? 0 : 100;
+    this.constrainBounds(proposedStrand, {
+      ref: true,
+      panPadding: zoomPanPadding,
+    });
 
     return proposedStrand;
   }
@@ -883,6 +1141,32 @@ export class Runtime {
 
   reset() {
     this.renderer.reset();
+    this.resetReadyState('runtime-reset');
+  }
+
+  resetReadyState(reason: AtlasReadyResetReason = 'manual') {
+    this.ready = false;
+    this.readyCycle += 1;
+    this.readyReason = reason;
+    this.readyTimestamp = undefined;
+    if (this.renderer.resetReadyState) {
+      this.renderer.resetReadyState();
+    }
+    this.pendingUpdate = true;
+  }
+
+  getReadyState(): {
+    ready: boolean;
+    cycle: number;
+    reason: AtlasReadyResetReason;
+    timestamp?: number;
+  } {
+    return {
+      ready: this.ready,
+      cycle: this.readyCycle,
+      reason: this.readyReason,
+      timestamp: this.readyTimestamp,
+    };
   }
 
   selectZone(zone: number | string) {
@@ -890,9 +1174,98 @@ export class Runtime {
     this.pendingUpdate = true;
   }
 
+  goToZone(
+    id: string,
+    options: {
+      paddingPx?: number | { left?: number; right?: number; top?: number; bottom?: number };
+      immediate?: boolean;
+    } = {}
+  ): boolean {
+    const zone = this.world.getZoneById(id);
+    if (!zone) {
+      return false;
+    }
+
+    zone.recalculateBounds();
+    if (zone.points[0] === 0) {
+      return false;
+    }
+
+    this.world.selectZone(id);
+
+    const homeTarget = this.getHomeTarget({
+      position: zone.points,
+      paddingPx: options.paddingPx,
+    });
+
+    if (options.immediate) {
+      this.transitionManager.stopTransition();
+      this.setViewport(homeTarget);
+      this.constrainBounds(this.target, { ref: true });
+      this.updateControllerPosition();
+      this.pendingUpdate = true;
+      return true;
+    }
+
+    this.transitionManager.applyTransition(
+      DnaFactory.singleBox(homeTarget.width, homeTarget.height, homeTarget.x, homeTarget.y),
+      undefined,
+      {
+        duration: 1000,
+        easing: easingFunctions.easeOutExpo,
+        constrain: false,
+      }
+    );
+    this.updateNextFrame();
+    this.pendingUpdate = true;
+
+    return true;
+  }
+
   deselectZone() {
     this.world.deselectZone();
     this.pendingUpdate = true;
+  }
+
+  getZoneRuntimeState(zoneId: string, viewport: Projection = this.getViewport()): RuntimeZoneState {
+    const zone = this.world.getZoneById(zoneId);
+    if (!zone) {
+      return {
+        zoneId,
+        exists: false,
+        active: false,
+        visibleInViewport: false,
+      };
+    }
+
+    zone.recalculateBounds();
+    const active = this.world.getActiveZone()?.id === zoneId;
+
+    if (zone.points[0] === 0) {
+      return {
+        zoneId,
+        exists: true,
+        active,
+        visibleInViewport: false,
+      };
+    }
+
+    const zoneX = zone.points[1];
+    const zoneY = zone.points[2];
+    const zoneWidth = zone.points[3] - zone.points[1];
+    const zoneHeight = zone.points[4] - zone.points[2];
+    const visibleInViewport =
+      zoneX < viewport.x + viewport.width &&
+      zoneX + zoneWidth > viewport.x &&
+      zoneY < viewport.y + viewport.height &&
+      zoneY + zoneHeight > viewport.y;
+
+    return {
+      zoneId,
+      exists: true,
+      active,
+      visibleInViewport,
+    };
   }
 
   hook<Name extends keyof RuntimeHooks, Arg = UnwrapHookArg<Name>>(name: keyof RuntimeHooks, arg: Arg) {
@@ -935,14 +1308,22 @@ export class Runtime {
     // Called every frame.
     this.hook('useFrame', delta);
 
-    const pendingUpdate = this.pendingUpdate;
+    let pendingUpdate = this.pendingUpdate;
     const rendererPendingUpdate = this.renderer.pendingUpdate();
+    const worldPendingUpdate = this.world.hasPendingAnimation();
+    const debugEnabled = this.hasDebugSubscribers();
 
     if (this.transitionManager.hasPending()) {
       this.transitionManager.runTransition(this.target, delta);
 
       this.pendingUpdate = true;
+      pendingUpdate = true;
       this.updateControllerPosition();
+    }
+
+    if (worldPendingUpdate) {
+      this.pendingUpdate = true;
+      pendingUpdate = true;
     }
 
     if (
@@ -950,6 +1331,7 @@ export class Runtime {
       !pendingUpdate &&
       // Check if there was a pending update from the renderer.
       !rendererPendingUpdate &&
+      !worldPendingUpdate &&
       // Then check the points, the first will catch invalidation.
       this.target[0] === this.lastTarget[0] &&
       // The following are x1, y1, x2, y2 points of the target.
@@ -964,6 +1346,22 @@ export class Runtime {
 
     // Group.
     // console.groupCollapsed(`Previous frame took ${delta} ${delta > 17 ? '<-' : ''} ${delta > 40 ? '<--' : ''}`);
+    const frame = ++this.debugFrame;
+    let paintCount = 0;
+
+    if (debugEnabled) {
+      this.emitDebug({
+        type: 'frame-start',
+        at: t,
+        runtimeId: this.id,
+        frame,
+        delta,
+        mode: this.mode,
+        pendingUpdate,
+        rendererPendingUpdate,
+        target: [this.target[1], this.target[2], this.target[3], this.target[4]],
+      });
+    }
 
     this.hook('useBeforeFrame', delta);
     // Before everything kicks off, add a hook.
@@ -1029,6 +1427,34 @@ export class Runtime {
           position[key + 3] - position[key + 1],
           position[key + 4] - position[key + 2]
         );
+        paintCount++;
+        if (debugEnabled) {
+          let imageUrl: string | undefined;
+          if ((paint as any).getImageUrl) {
+            try {
+              imageUrl = (paint as any).getImageUrl(i);
+            } catch (err) {
+              imageUrl = undefined;
+            }
+          }
+          this.emitDebug({
+            type: 'paint',
+            at: t,
+            runtimeId: this.id,
+            frame,
+            layerIndex: p,
+            tileIndex: i,
+            x: position[key + 1],
+            y: position[key + 2],
+            width: position[key + 3] - position[key + 1],
+            height: position[key + 4] - position[key + 2],
+            paintId: (paint as any).id || `${p}:${i}`,
+            paintType: paint?.constructor?.name || paint.type || 'UnknownPaint',
+            ownerId: (paint as any).__owner?.value?.id,
+            compositeId: (paint as any).__parent?.id,
+            imageUrl,
+          });
+        }
         this.hook('useAfterPaint', paint);
       }
 
@@ -1036,6 +1462,8 @@ export class Runtime {
     }
     // A final hook after the entire frame is complete.
     this.renderer.afterFrame(this.world, delta, this.target, this.hookOptions);
+    // Mark this frame as consumed before running after-frame hooks so hooks can request the next frame.
+    this.pendingUpdate = false;
     this.hook('useAfterFrame', delta);
     // Finally at the end, we set up the frame we just rendered.
     this.lastTarget[0] = this.target[0];
@@ -1045,11 +1473,28 @@ export class Runtime {
     this.lastTarget[4] = this.target[4];
     // We've just finished our first render.
     this.firstRender = false;
-    this.pendingUpdate = false;
     this.logNextRender = false;
-    if (this.renderer.isReady()) {
+    if (!this.ready && this.renderer.isReady()) {
       this.ready = true;
+      this.readyTimestamp = performance.now();
       this.world.trigger('ready');
+    }
+
+    if (debugEnabled) {
+      this.emitDebug({
+        type: 'frame-end',
+        at: t,
+        runtimeId: this.id,
+        frame,
+        delta,
+        scaleFactor,
+        paintCount,
+        ready: this.ready,
+        pendingUpdate: this.pendingUpdate,
+        worldWidth: this.world.width,
+        worldHeight: this.world.height,
+        target: [this.target[1], this.target[2], this.target[3], this.target[4]],
+      });
     }
     // Flush world subscriptions.
     this.world.flushSubscriptions();
@@ -1071,5 +1516,29 @@ export class Runtime {
 
   updateNextFrame() {
     this.pendingUpdate = true;
+  }
+
+  addDebugSubscriber(callback: (event: RuntimeDebugEvent) => void) {
+    this.debugSubscribers.add(callback);
+    return () => {
+      this.removeDebugSubscriber(callback);
+    };
+  }
+
+  removeDebugSubscriber(callback: (event: RuntimeDebugEvent) => void) {
+    this.debugSubscribers.delete(callback);
+  }
+
+  private hasDebugSubscribers() {
+    return this.debugSubscribers.size > 0;
+  }
+
+  private emitDebug(event: RuntimeDebugEvent) {
+    if (this.debugSubscribers.size === 0) {
+      return;
+    }
+    for (const callback of this.debugSubscribers) {
+      callback(event);
+    }
   }
 }

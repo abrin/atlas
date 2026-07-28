@@ -1,7 +1,7 @@
-import { Runtime } from '../../renderer/runtime';
-import { distance } from '../../utils';
-import { BaseObject } from '../../objects/base-object';
 import { supportedEventMap } from '../../events';
+import type { BaseObject } from '../../objects/base-object';
+import type { Runtime } from '../../renderer/runtime';
+import { distance } from '../../utils';
 
 export type BrowserEventManagerOptions = {
   /** Default 50ms **/
@@ -92,6 +92,10 @@ export class BrowserEventManager {
     e.atlas = BrowserEventManager.eventPool.atlas;
   }
 
+  isHoldToHomeIntentActive() {
+    return this.element.dataset.intent === 'hold-home';
+  }
+
   activateEvents() {
     this.listening = true;
     this.element.addEventListener('pointermove', this._realPointerMove);
@@ -105,6 +109,7 @@ export class BrowserEventManager {
 
     // Edge-cases
     this.element.addEventListener('wheel', this.onWheelEvent);
+    this.element.addEventListener('contextmenu', this.onContextMenu);
 
     // Touch events.
     this.element.addEventListener('touchstart', this.onTouchEvent);
@@ -121,6 +126,16 @@ export class BrowserEventManager {
     e.preventDefault();
 
     this.onPointerEvent(e);
+  };
+
+  onContextMenu = (e: MouseEvent) => {
+    e.preventDefault();
+    const ev = 'onContextMenu';
+    if (this.runtime.world.activatedEvents.indexOf(ev) !== -1) {
+      const { x, y } = this.runtime.viewerToWorld(e.clientX - this.bounds.left, e.clientY - this.bounds.top);
+      this.assignToEvent(e, x, y);
+      this.runtime.world.propagatePointerEvent(ev as any, e, x, y);
+    }
   };
 
   onTouchEvent = (e: TouchEvent) => {
@@ -143,7 +158,7 @@ export class BrowserEventManager {
       this.assignToEvent(e, atlasTouches[0].x, atlasTouches[0].y);
     }
 
-    if (type !== 'onTouchEnd') {
+    if (type !== 'onTouchEnd' && type !== 'onTouchCancel') {
       this.pointerEventState.lastTouches = atlasTouches;
       (e as any).atlasTouches = atlasTouches;
       this.runtime.world.propagateTouchEvent(type, e as any, atlasTouches);
@@ -155,6 +170,9 @@ export class BrowserEventManager {
   };
 
   onPointerEvent = (e: PointerEvent | MouseEvent) => {
+    if (e.button === 2) {
+      return;
+    }
     const ev = (supportedEventMap as any)[e.type as any];
     if (ev && this.runtime.world.activatedEvents.indexOf(ev) !== -1) {
       const { x, y } = this.runtime.viewerToWorld(e.clientX - this.bounds.left, e.clientY - this.bounds.top);
@@ -164,6 +182,9 @@ export class BrowserEventManager {
   };
 
   onPointerDown = (e: PointerEvent | MouseEvent) => {
+    if (e.button === 2) {
+      return;
+    }
     this.pointerEventState.isPressed = true;
     this.pointerEventState.isClicking = true;
     this.pointerEventState.mouseDownStart.x = e.clientX;
@@ -175,6 +196,9 @@ export class BrowserEventManager {
     }, 250);
     setTimeout(() => {
       if (this.runtime && this.pointerEventState.isPressed && !this.pointerEventState.isDragging) {
+        if (this.isHoldToHomeIntentActive()) {
+          return;
+        }
         const dragStart = this.runtime.viewerToWorld(
           this.pointerEventState.mouseDownStart.x - this.bounds.left,
           this.pointerEventState.mouseDownStart.y - this.bounds.top
@@ -194,6 +218,9 @@ export class BrowserEventManager {
   };
 
   onPointerUp = (e: PointerEvent | MouseEvent) => {
+    if (e.button === 2) {
+      return;
+    }
     if (this.pointerEventState.isClicking) {
       const { x, y } = this.runtime.viewerToWorld(e.clientX - this.bounds.left, e.clientY - this.bounds.top);
 
@@ -269,7 +296,11 @@ export class BrowserEventManager {
     if (
       this.pointerEventState.isPressed &&
       !this.pointerEventState.isDragging &&
-      distance(this.pointerEventState.mouseDownStart, { x: e.clientX, y: e.clientY }) > 50
+      !this.isHoldToHomeIntentActive() &&
+      distance(this.pointerEventState.mouseDownStart, {
+        x: e.clientX,
+        y: e.clientY,
+      }) > 50
     ) {
       const dragStart = this.runtime.viewerToWorld(
         this.pointerEventState.mouseDownStart.x - this.bounds.left,

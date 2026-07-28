@@ -1,34 +1,169 @@
-import Reconciler, { OpaqueHandle } from 'react-reconciler';
-import { now } from './utility/now';
+import React, { version } from 'react';
+import type { OpaqueHandle } from 'react-reconciler';
+import Reconciler_ from 'react-reconciler';
+import type { AtlasObjectModel } from '../../aom';
+import { supportedEventAttributes, supportedEventMap } from '../../events';
+import { BaseObject } from '../../objects/base-object';
+import { Box } from '../../objects/box';
+import { Geometry } from '../../objects/geometry';
+import { Text } from '../../objects/text';
 import { Runtime } from '../../renderer/runtime';
+import { CompositeResource } from '../../spacial-content/composite-resource';
+import { ImageTexture } from '../../spacial-content/image-texture';
+import { MapTiledImage } from '../../spacial-content/map-tiled-image';
 import { SingleImage } from '../../spacial-content/single-image';
+import { TiledImage } from '../../spacial-content/tiled-image';
 import { World } from '../../world';
 import { WorldObject } from '../../world-objects/world-object';
-import { AtlasObjectModel } from '../../aom';
-import { BaseObject } from '../../objects/base-object';
-import { TiledImage } from '../../spacial-content/tiled-image';
-import { CompositeResource } from '../../spacial-content/composite-resource';
-import { Text } from '../../objects/text';
-import { Box } from '../../objects/box';
-import { supportedEventAttributes, supportedEventMap } from '../../events';
-import { ImageTexture } from '../../spacial-content/image-texture';
-import { version } from 'react';
-import { Geometry } from '../../objects/geometry';
-const DefaultEventPriority = 0b0000000000000000000000000010000;
+import { Zone } from '../../world-objects/zone';
+import { now } from './utility/now';
+
+const Reconciler =
+  typeof Reconciler_ === 'function'
+    ? Reconciler_
+    : typeof (Reconciler_ as any)?.default === 'function'
+    ? (Reconciler_ as any).default
+    : null;
+
+// From react-reconciler/constants;
+// import { ContinuousEventPriority, DiscreteEventPriority, DefaultEventPriority } from 'react-reconciler/constants'
+const ConcurrentRoot = 1;
+const ContinuousEventPriority = 8;
+const DefaultEventPriority = 32;
+const DiscreteEventPriority = 2;
+const IdleEventPriority = 268435456;
+const LegacyRoot = 0;
+const NoEventPriority = 0;
+
+type ZoneHostProps = {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  margin?: number;
+};
+
+class ZoneHostInstance implements AtlasObjectModel<ZoneHostProps, any> {
+  world: World;
+  zone: Zone;
+  private isRegistered = false;
+  private directWorldObjects: WorldObject[] = [];
+
+  constructor(world: World) {
+    this.world = world;
+    this.zone = new Zone({ id: '' });
+  }
+
+  applyProps(props: ZoneHostProps): void {
+    this.zone.applyProps({
+      id: props.id,
+      x: props.x,
+      y: props.y,
+      width: props.width,
+      height: props.height,
+      margin: props.margin,
+    });
+  }
+
+  appendChild(item: unknown): void {
+    if (!(item instanceof WorldObject)) {
+      return;
+    }
+    this.registerDirectWorldObject(item);
+    this.world.appendChild(item);
+  }
+
+  removeChild(item: unknown): void {
+    if (!(item instanceof WorldObject)) {
+      return;
+    }
+    this.unregisterDirectWorldObject(item);
+    this.world.removeChild(item);
+  }
+
+  insertBefore(item: unknown, before: unknown): void {
+    if (!(item instanceof WorldObject)) {
+      return;
+    }
+    this.registerDirectWorldObject(item);
+    if (before instanceof WorldObject) {
+      this.world.insertBefore(item, before);
+      return;
+    }
+    this.world.appendChild(item);
+  }
+
+  hideInstance(): void {
+    // no-op
+  }
+
+  attachToWorld(world: World) {
+    if (this.isRegistered && this.world !== world) {
+      this.world.removeZone(this.zone);
+      this.isRegistered = false;
+    }
+    this.world = world;
+    if (!this.isRegistered) {
+      this.world.addZone(this.zone);
+      this.isRegistered = true;
+    }
+  }
+
+  unmount() {
+    this.directWorldObjects = [];
+    if (this.isRegistered) {
+      this.world.removeZone(this.zone);
+      this.isRegistered = false;
+    }
+  }
+
+  private registerDirectWorldObject(item: WorldObject) {
+    if (this.directWorldObjects.indexOf(item) === -1) {
+      this.directWorldObjects.push(item);
+    }
+    this.zone.addObject(item);
+  }
+
+  private unregisterDirectWorldObject(item: WorldObject) {
+    this.directWorldObjects = this.directWorldObjects.filter((zoneObject) => zoneObject !== item);
+    this.zone.removeObject(item);
+  }
+}
 
 function appendChild(parent: AtlasObjectModel<any, any>, child: any) {
+  if (parent instanceof World && child instanceof ZoneHostInstance) {
+    child.attachToWorld(parent);
+    return;
+  }
+  if (parent instanceof ZoneHostInstance) {
+    parent.appendChild(child);
+    return;
+  }
   if (parent && parent.appendChild && child) {
     parent.appendChild(child);
   }
 }
 
 function removeChild(parent: AtlasObjectModel<any, any>, child: any) {
+  if (parent instanceof World && child instanceof ZoneHostInstance) {
+    child.unmount();
+    return;
+  }
+  if (parent instanceof ZoneHostInstance) {
+    parent.removeChild(child);
+    return;
+  }
   if (parent && parent.removeChild && child) {
     parent.removeChild(child);
   }
 }
 
 function removeChildFromContainer(parent: Runtime, child: any) {
+  if (child instanceof ZoneHostInstance) {
+    child.unmount();
+    return;
+  }
   return removeChild(parent.world, child);
 }
 function insertInContainerBefore(
@@ -36,12 +171,23 @@ function insertInContainerBefore(
   child: AtlasObjectModel<any, any>,
   beforeChild: AtlasObjectModel<any, any>
 ) {
+  if (child instanceof ZoneHostInstance) {
+    child.attachToWorld(container.world);
+    return;
+  }
   return insertBefore(container.world, child, beforeChild);
 }
 
 function insertBefore(parent: Runtime | AtlasObjectModel<any, any>, child: any, before: any) {
   if (parent && parent instanceof Runtime) {
     parent = parent.world;
+  }
+  if (parent instanceof World && child instanceof ZoneHostInstance) {
+    return;
+  }
+  if (parent instanceof ZoneHostInstance) {
+    parent.insertBefore(child, before);
+    return;
   }
   if (parent && parent.insertBefore) {
     parent.insertBefore(child, before);
@@ -55,6 +201,7 @@ export function applyProps(instance: any, oldProps: any, newProps: any) {
   if (instance.applyProps) {
     instance.applyProps(newProps);
   }
+
   if (instance instanceof BaseObject) {
     for (const ev of supportedEventAttributes) {
       const event = ev.slice(2).toLowerCase();
@@ -94,21 +241,25 @@ function createInstance(
   { args = [], ...props }: any,
   runtime: Runtime,
   hostContext?: any,
-  internalInstanceHandle?: Reconciler.Fiber
+  internalInstanceHandle?: Reconciler_.Fiber
 ) {
   if (!(runtime instanceof Runtime) && internalInstanceHandle) {
-    const fn = (node: Reconciler.Fiber): Runtime => {
+    const fn = (node: Reconciler_.Fiber): Runtime => {
       if (!node.return) return node.stateNode && node.stateNode.containerInfo;
       else return fn(node.return);
     };
     runtime = fn(internalInstanceHandle);
   }
 
-  let instance: BaseObject<any, any>;
+  let instance: BaseObject<any, any> | ZoneHostInstance;
   let world: World = runtime.world;
   switch (type) {
     case 'world':
-      instance = World.withProps({ width: props.width, height: props.height, viewingDirection: 'left-to-right' });
+      instance = World.withProps({
+        width: props.width,
+        height: props.height,
+        viewingDirection: 'left-to-right',
+      });
       (instance as World).activatedEvents = world.activatedEvents;
       (instance as World).eventHandlers = world.eventHandlers;
       (instance as World).subscriptions = world.subscriptions;
@@ -124,6 +275,9 @@ function createInstance(
     case 'worldObject':
     case 'world-object':
       instance = new WorldObject();
+      break;
+    case 'zone':
+      instance = new ZoneHostInstance(world);
       break;
     case 'worldImage':
     case 'world-image':
@@ -145,7 +299,31 @@ function createInstance(
       break;
     case 'tiledImage':
     case 'tiled-image':
-      instance = TiledImage.fromTile(props.uri, props.display, props.tile, props.scaleFactor, undefined, props.format, props.useFloorCalc, props.version3);
+      instance = TiledImage.fromTile(
+        props.uri,
+        props.display,
+        props.tile,
+        props.scaleFactor,
+        undefined,
+        props.format,
+        props.useFloorCalc,
+        props.version3
+      );
+      break;
+    case 'mapTiledImage':
+    case 'map-tiled-image':
+      instance = new MapTiledImage({
+        id: props.id,
+        bounds: props.bounds,
+        worldWidth: props.worldWidth,
+        worldHeight: props.worldHeight,
+        zoom: props.zoom,
+        tileSize: props.tileSize,
+        scaleFactor: props.scaleFactor,
+        tileSource: props.tileSource,
+        tileUrlTemplate: props.tileUrlTemplate,
+        subdomains: props.subdomains,
+      });
       break;
     case 'paragraph':
       instance = new Text();
@@ -165,6 +343,8 @@ function createInstance(
 function appendChildToContainer(runtime: Runtime, world: any) {
   if (world instanceof World) {
     runtime.world = world;
+  } else if (world instanceof ZoneHostInstance) {
+    world.attachToWorld(runtime.world);
   } else if (world instanceof WorldObject) {
     runtime.world.appendChild(world);
   } else if (world) {
@@ -172,176 +352,222 @@ function appendChildToContainer(runtime: Runtime, world: any) {
   }
 }
 
-const reconciler = Reconciler<
-  any,
-  any,
-  Runtime,
-  unknown, // Instance,
-  unknown, // TextInstance,
-  unknown, // SuspenseInstance,
-  unknown, // HydratableInstance,
-  unknown, // PublicInstance,
-  unknown, // HostContext,
-  unknown, // UpdatePayload,
-  unknown, // _ChildSet,
-  unknown, // TimeoutHandle,
-  unknown // NoTimeout
->({
-  // @ts-ignore
-  unstable_now: now,
-  // @ts-ignore
-  now,
-  createInstance,
-  removeChild,
-  appendChild,
-  appendInitialChild: appendChild,
-  insertBefore: insertBefore,
-  warnsIfNotActing: true,
-  supportsMutation: true,
-  isPrimaryRenderer: false,
-  // @ts-ignore
-  scheduleTimeout: typeof setTimeout !== 'undefined' ? setTimeout : undefined,
-  // @ts-ignore
-  cancelTimeout: typeof clearTimeout !== 'undefined' ? clearTimeout : undefined,
-  setTimeout: typeof setTimeout !== 'undefined' ? setTimeout : undefined,
-  clearTimeout: typeof clearTimeout !== 'undefined' ? clearTimeout : undefined,
-  noTimeout: -1,
-  appendChildToContainer,
-  removeChildFromContainer: removeChildFromContainer,
-  createTextInstance() {
-    // no-op
-  },
-  insertInContainerBefore: insertInContainerBefore,
-  prepareUpdate(instance: any, type: any, oldProps: any, newProps: any, runtime: Runtime) {
-    activateEvents(runtime.world, newProps);
-    return newProps;
-  },
-  commitUpdate(
-    instance: any,
-    updatePayload: any,
-    type: any,
-    prevProps: any,
-    nextProps: any,
-    internalHandle: OpaqueHandle
-  ) {
-    if (instance.applyProps && updatePayload) {
-      applyProps(instance, prevProps, updatePayload);
-    }
-  },
+let currentUpdatePriority = NoEventPriority;
 
-  finalizeInitialChildren(instance: any) {
-    // https://github.com/facebook/react/issues/20271
-    // Returning true will trigger commitMount
-    return instance?.__handlers;
-  },
-  getChildHostContext() {
-    return emptyObject;
-  },
-  getRootHostContext() {
-    return emptyObject;
-  },
-  prepareForCommit(runtime) {
-    runtime.isCommitting = true;
-    return null;
-  },
-  preparePortalMount() {
-    // no-op
-  },
-  hideInstance(instance: BaseObject) {
-    if (instance && instance.points) {
-      instance.points[0] = 0;
-    }
-    // @todo these are called when a component is suspended
-  },
-  unhideInstance(instance: BaseObject, props: any) {
-    if (instance && instance.points) {
-      instance.points[0] = 1;
-    }
-    // @todo these are called when a component is suspended
-  },
-  getPublicInstance(instance: BaseObject) {
-    return instance;
-  },
-  hideTextInstance() {
-    throw new Error(
-      'Text is not allowed in the react-three-fibre tree. You may have extraneous whitespace between components.'
-    );
-  },
-  resetAfterCommit(runtime) {
-    runtime.isCommitting = false;
-    runtime.pendingUpdate = true;
-    if (runtime.world) {
-      if (runtime.world.needsRecalculate) {
-        runtime.world.recalculateWorldSize();
-        runtime.world.triggerRepaint();
-      }
-    }
-  },
-  shouldSetTextContent() {
-    return false;
-  },
-  clearContainer() {
-    return false;
-  },
+const reconciler = Reconciler
+  ? Reconciler<
+      any,
+      any,
+      Runtime,
+      unknown, // Instance,
+      unknown, // TextInstance,
+      unknown, // SuspenseInstance,
+      unknown, // HydratableInstance,
+      unknown, // PublicInstance,
+      unknown, // HostContext,
+      unknown, // UpdatePayload,
+      unknown, // _ChildSet,
+      unknown, // TimeoutHandle,
+      unknown // NoTimeout
+    >({
+      // @ts-expect-error
+      unstable_now: now,
+      // @ts-expect-error
+      now,
+      createInstance,
+      removeChild,
+      appendChild,
+      appendInitialChild: appendChild,
+      insertBefore: insertBefore,
+      warnsIfNotActing: true,
+      supportsMutation: true,
+      isPrimaryRenderer: false,
+      // @ts-expect-error
+      scheduleTimeout: typeof setTimeout !== 'undefined' ? setTimeout : undefined,
+      // @ts-expect-error
+      cancelTimeout: typeof clearTimeout !== 'undefined' ? clearTimeout : undefined,
+      setTimeout: typeof setTimeout !== 'undefined' ? setTimeout : undefined,
+      clearTimeout: typeof clearTimeout !== 'undefined' ? clearTimeout : undefined,
+      noTimeout: -1,
+      appendChildToContainer,
+      removeChildFromContainer: removeChildFromContainer,
+      createTextInstance() {
+        // no-op
+      },
+      insertInContainerBefore: insertInContainerBefore,
+      prepareUpdate(instance: any, type: any, oldProps: any, newProps: any, runtime: Runtime) {
+        activateEvents(runtime.world, newProps);
+        return newProps;
+      },
+      commitUpdate(instance: any, type_: any, prevProps_: any, updatePayload_: any, internalHandle: OpaqueHandle) {
+        let type = type_,
+          updatePayload = updatePayload_;
+        const prevProps = prevProps_;
+        if (typeof updatePayload === 'string') {
+          // react <= 18
+          type = updatePayload_;
+          updatePayload = prevProps_;
+        }
 
-  // 0.29.0 and later
-  supportsHydration: false,
-  supportsPersistence: false,
+        if (instance.applyProps && updatePayload) {
+          applyProps(instance, prevProps, updatePayload);
+        }
+      },
 
-  detachDeletedInstance(node) {
-    // no-op?
-    // console.log('detachDeletedInstance', node);
-  },
+      finalizeInitialChildren(instance: any) {
+        // https://github.com/facebook/react/issues/20271
+        // Returning true will trigger commitMount
+        return instance?.__handlers;
+      },
+      getChildHostContext() {
+        return emptyObject;
+      },
+      getRootHostContext() {
+        return emptyObject;
+      },
+      prepareForCommit(runtime) {
+        runtime.isCommitting = true;
+        return null;
+      },
+      preparePortalMount() {
+        // no-op
+      },
+      hideInstance(instance: BaseObject) {
+        if (instance && instance.points) {
+          instance.points[0] = 0;
+        }
+        // @todo these are called when a component is suspended
+      },
+      unhideInstance(instance: BaseObject, props: any) {
+        if (instance && instance.points) {
+          instance.points[0] = 1;
+        }
+        // @todo these are called when a component is suspended
+      },
+      getPublicInstance(instance: BaseObject) {
+        return instance;
+      },
+      hideTextInstance() {
+        throw new Error(
+          'Text is not allowed in the react-three-fibre tree. You may have extraneous whitespace between components.'
+        );
+      },
+      resetAfterCommit(runtime) {
+        runtime.isCommitting = false;
+        runtime.pendingUpdate = true;
+        if (runtime.world) {
+          if (runtime.world.needsRecalculate) {
+            runtime.world.recalculateWorldSize();
+            runtime.world.triggerRepaint();
+          }
+        }
+      },
+      shouldSetTextContent() {
+        return false;
+      },
+      clearContainer() {
+        return false;
+      },
 
-  afterActiveInstanceBlur() {
-    // no-op
-  },
+      // 0.29.0 and later
+      supportsHydration: false,
+      supportsPersistence: false,
 
-  beforeActiveInstanceBlur() {
-    // no-op
-  },
+      detachDeletedInstance(node) {
+        // no-op?
+        // console.log('detachDeletedInstance', node);
+      },
 
-  getCurrentEventPriority() {
-    console.log('getCurrentEventPriority');
-    // If in the browser, check `window.event` and maybe do something different.
-    return DefaultEventPriority;
-  },
+      afterActiveInstanceBlur() {
+        // no-op
+      },
 
-  getInstanceFromNode(node) {
-    console.log('getInstanceFromNode', node);
-    throw new Error('Not implemented');
-  },
+      beforeActiveInstanceBlur() {
+        // no-op
+      },
 
-  getInstanceFromScope(scopeInstance) {
-    console.log('getInstanceFromScope', scopeInstance);
-    throw new Error('Not implemented');
-    // return nodeToInstanceMap.get(scopeInstance) || null;
-  },
+      getCurrentEventPriority() {
+        // If in the browser, check `window.event` and maybe do something different.
+        return DefaultEventPriority;
+      },
 
-  prepareScopeUpdate(scopeInstance, instance) {
-    console.log('prepareScopeUpdate', scopeInstance, instance);
-    throw new Error('Not implemented');
-    // nodeToInstanceMap.set(scopeInstance, instance);
-  },
+      getInstanceFromNode(node) {
+        throw new Error('Not implemented');
+      },
 
-  logRecoverableError() {
-    // noop
-  },
+      getInstanceFromScope(scopeInstance) {
+        throw new Error('Not implemented');
+        // return nodeToInstanceMap.get(scopeInstance) || null;
+      },
 
-  requestPostPaintCallback() {
-    // noop
-  },
-});
+      prepareScopeUpdate(scopeInstance, instance) {
+        throw new Error('Not implemented');
+        // nodeToInstanceMap.set(scopeInstance, instance);
+      },
 
-reconciler.injectIntoDevTools({
-  bundleType: process.env.NODE_ENV === 'production' ? 0 : 1,
-  version: version,
-  rendererPackageName: '@atlas-viewer/atlas',
-});
+      logRecoverableError() {
+        // noop
+      },
+
+      requestPostPaintCallback() {
+        // noop
+      },
+
+      rendererPackageName: '@atlas-viewer/atlas',
+      rendererVersion: version,
+
+      // React 19.
+      shouldAttemptEagerTransition: () => false,
+      trackSchedulerEvent: () => {},
+      resolveEventType: () => null,
+      resolveEventTimeStamp: () => -1.1,
+      maySuspendCommit: () => false,
+      preloadInstance: () => true, // true indicates already loaded
+      startSuspendingCommit() {},
+      suspendInstance() {},
+      waitForCommitToBeReady: () => null,
+      NotPendingTransition: null,
+      setCurrentUpdatePriority(newPriority: number) {
+        currentUpdatePriority = newPriority;
+      },
+      getCurrentUpdatePriority() {
+        return currentUpdatePriority;
+      },
+      resolveUpdatePriority() {
+        if (currentUpdatePriority !== NoEventPriority) return currentUpdatePriority;
+
+        switch (typeof window !== 'undefined' && window.event?.type) {
+          case 'click':
+          case 'contextmenu':
+          case 'dblclick':
+          case 'pointercancel':
+          case 'pointerdown':
+          case 'pointerup':
+            return DiscreteEventPriority;
+          case 'pointermove':
+          case 'pointerout':
+          case 'pointerover':
+          case 'pointerenter':
+          case 'pointerleave':
+          case 'wheel':
+            return ContinuousEventPriority;
+          default:
+            return DefaultEventPriority;
+        }
+      },
+      resetFormInstance() {},
+    })
+  : null;
+
+if (reconciler) {
+  // @ts-expect-error DefinitelyTyped is not up to date
+  reconciler.injectIntoDevTools();
+}
 
 export function unmountComponentAtNode(runtime: Runtime, callback?: (runtime: any) => void) {
   const root = roots.get(runtime);
   if (root) {
+    if (!reconciler) return;
     reconciler.updateContainer(null, root, null, () => {
       roots.delete(runtime);
       if (callback) callback(runtime);
@@ -352,6 +578,8 @@ export function unmountComponentAtNode(runtime: Runtime, callback?: (runtime: an
 export const ReactAtlas = {
   render(whatToRender: any, runtime: any) {
     const root = roots.get(runtime);
+
+    if (!reconciler) return;
 
     if (root) {
       reconciler.updateContainer(whatToRender, root, null);
