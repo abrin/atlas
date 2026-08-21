@@ -433,6 +433,7 @@ export const popmotionController = (config: PopmotionControllerConfig = {}): Run
         clearPanSamples();
         clearGestureState();
         resetState();
+        runtime.endInteraction();
       }
 
       function releaseGesturePointer() {
@@ -463,6 +464,7 @@ export const popmotionController = (config: PopmotionControllerConfig = {}): Run
         clearPanSamples();
         clearGestureState();
         resetState();
+        runtime.endInteraction();
       }
 
       runtime.world.activatedEvents.push(
@@ -521,6 +523,7 @@ export const popmotionController = (config: PopmotionControllerConfig = {}): Run
         if (e.which > 1) {
           resetHoldToHomeState();
           state.isPressing = false;
+          runtime.endInteraction();
           return;
         }
         if (runtime.mode === 'explore') {
@@ -536,6 +539,10 @@ export const popmotionController = (config: PopmotionControllerConfig = {}): Run
 
           state.isPressing = true;
           armHoldToHome(typeof e.clientX === 'number' ? e.clientX : 0, typeof e.clientY === 'number' ? e.clientY : 0);
+          // Matches onTouchStart's own unconditional call below --
+          // Runtime#beginInteraction is itself a no-op when a gesture is
+          // already in progress, so this doesn't need its own guard here.
+          runtime.beginInteraction();
         }
       }
 
@@ -592,6 +599,7 @@ export const popmotionController = (config: PopmotionControllerConfig = {}): Run
           runtime.transitionManager.stopTransition();
 
           state.isPressing = true;
+          runtime.beginInteraction();
         }
       }
 
