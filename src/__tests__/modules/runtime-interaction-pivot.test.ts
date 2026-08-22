@@ -175,6 +175,60 @@ describe('Runtime interaction-gated rotation pivot', () => {
     expect((runtime as any).currentWorldPivot()).toEqual(frozen);
   });
 
+  // Regression coverage for a real, reported bug: a quick click landing
+  // while a previous gesture's pivot switch is still pending (e.g. it's
+  // deferred behind an active inertial pan-momentum glide, see
+  // Runtime#panMomentumActive) used to silently discard that pending switch
+  // in beginInteraction() -- clearing pivotSwitchPending without ever
+  // running the compensation finalizePivotSwitch() would have applied. The
+  // object was still actually being rendered around the OLD frozen pivot
+  // right up until that click; beginInteraction() then froze a *new* pivot
+  // at the live view, so the very next frame rendered it around a different
+  // pivot with no compensating position change in between -- a real,
+  // visible jump, sideways relative to whatever was panning (a pivot
+  // change, not a bounds correction).
+  test('a new gesture starting while a previous pivot switch is still pending settles that switch first, instead of dropping it', () => {
+    const owner = makeOwner(100, 80, 60, 40, 30);
+    const { runtime, state } = makeRuntime([owner]);
+    runtime.rotateFromWorldCenter = true;
+
+    // Gesture 1: a fling. Pan happens during it, same as a real drag.
+    runtime.beginInteraction();
+    state.panOffset = { x: 200, y: 100 };
+    runtime.endInteraction();
+
+    // Momentum now carries the view further *after* the gesture ended --
+    // finalizePivotSwitch is deferred behind that (panMomentumActive),
+    // exactly like being mid-drag: the pivot is still the one frozen at
+    // gesture 1's start, not live.
+    state.panOffset = { x: 260, y: 140 };
+    expect((runtime as any).pivotSwitchPending).toBe(true);
+
+    const pivotBeforeClick = renderedCenterOfPivot(runtime);
+    const rawBeforeClick = rawScreenCenter(runtime, owner);
+    const renderedBeforeClick = renderedCenter(rawBeforeClick, pivotBeforeClick, owner.rotation);
+
+    // Gesture 2: a quick click interrupts the glide (momentum's own
+    // stopPanMomentum() already halted `target`, so no further panning
+    // happens here) while gesture 1's switch is still pending.
+    runtime.beginInteraction();
+
+    const pivotAfterClick = renderedCenterOfPivot(runtime);
+    const rawAfterClick = rawScreenCenter(runtime, owner);
+    const renderedAfterClick = renderedCenter(rawAfterClick, pivotAfterClick, owner.rotation);
+
+    // The object's on-screen position must be continuous across the switch
+    // -- not jump just because a new gesture happened to start while the
+    // old one's switch was still pending.
+    expect(renderedAfterClick.x).toBeCloseTo(renderedBeforeClick.x);
+    expect(renderedAfterClick.y).toBeCloseTo(renderedBeforeClick.y);
+
+    // The new gesture's own freeze took effect (pending switch was settled,
+    // not left dangling).
+    expect((runtime as any).pivotSwitchPending).toBe(false);
+    expect(runtime.isInteracting).toBe(true);
+  });
+
   test('finalizePivotSwitch compensates rotated objects so their rendered position does not jump, then resumes live tracking', () => {
     const owner = makeOwner(100, 80, 60, 40, 30);
     const { runtime, state } = makeRuntime([owner]);

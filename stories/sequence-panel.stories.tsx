@@ -739,7 +739,9 @@ export const SequencePanel = () => {
 
       nextOpening(); 
       nudgeSoon();
+      await sleep(1000);
       setRotation((r) => (r + 90) % 360);
+      await sleep(1000);
       nudgeSoon();
       runtime?.world.zoomIn();
       nudgeSoon();

@@ -209,6 +209,26 @@ export class Runtime {
   private fixedWorldPivot: { x: number; y: number } | undefined;
 
   /**
+   * Set by whichever pan controller is attached (see
+   * PopmotionController's momentum handling) while an inertial/elastic
+   * pan-back-into-bounds animation is actively driving `target` frame by
+   * frame, and cleared once it settles. Momentum drives `target` via
+   * per-frame zero-duration transitions (TransitionManager#customTransition
+   * with total_time = 0) rather than one tracked transition, so it
+   * completes -- and transitionManager.hasPending() goes back to false --
+   * within the same frame it's applied. Left unchecked, the pivotSwitchPending
+   * finalize condition in render() (which exists specifically to wait out an
+   * out-of-bounds snap-back before switching the frozen pivot back to live --
+   * see finalizePivotSwitch) would see hasPending() as false on the very
+   * first frame after release and switch mid-flight, while momentum is still
+   * actively carrying a rotated object back into view -- producing a visible
+   * jump/drift instead of a clean return along the drag's own vector. This
+   * flag gives render() the same visibility into momentum's real lifetime
+   * that it already has into transitionManager's.
+   */
+  panMomentumActive = false;
+
+  /**
    * True from the moment a gesture ends until the pivot has actually
    * finished switching from frozen back to live -- see endInteraction and
    * finalizePivotSwitch. Kept separate from isInteracting (which tracks
@@ -266,17 +286,38 @@ export class Runtime {
     if (this.isInteracting) {
       return;
     }
-    this.isInteracting = true;
     // A previous gesture's pivot switch may still be waiting on its own
-    // out-of-bounds snap-back to settle (see finalizePivotSwitch) -- this
-    // new gesture supersedes it entirely: fixedWorldPivot is about to be
-    // recaptured fresh below, so there's nothing left for that pending
-    // switch to finalize.
+    // out-of-bounds snap-back -- or inertial pan momentum, see
+    // panMomentumActive -- to settle (see finalizePivotSwitch). Captured
+    // *before* isInteracting flips below: isInteracting's own setter drives
+    // pivotPhase, and pivotSwitchPending is a read of that same pivotPhase,
+    // so reading it after would always see 'interacting' and silently miss
+    // a real pending switch.
+    const hadPendingSwitch = this.pivotSwitchPending;
+    this.isInteracting = true;
+    // This new gesture (e.g. a quick click that interrupts an in-flight
+    // momentum glide) must not simply discard a still-pending switch --
+    // unlike a genuinely idle pivot, the object is still actually being
+    // rendered around the OLD frozen pivot right up until this call
+    // (pivotPhase stays 'switching', not 'idle', until finalizePivotSwitch
+    // runs), so dropping pivotSwitchPending without running that
+    // compensation would leave every rotated object rendered one frame
+    // around the old pivot and the next around whatever's live right now,
+    // with no compensating position change in between -- a real, visible
+    // jump (sideways relative to whatever was panning, not toward/away from
+    // it, since it's a pivot change, not a position correction). Finalizing
+    // it here settles that first, so the object's on-screen position is
+    // continuous across the switch.
+    if (hadPendingSwitch) {
+      this.finalizePivotSwitch();
+    }
     this.pivotSwitchPending = false;
     if (this._rotateFromWorldCenter) {
-      // No compensation needed here: this freezes the pivot at whatever the
-      // live pivot is *right now*, so their screen projections coincide by
-      // construction -- nothing has had a chance to drift yet.
+      // No compensation needed here: the pivot is now genuinely live
+      // (either it already was, or finalizePivotSwitch just settled it
+      // above), so freezing it at the live pivot *right now* coincides with
+      // its current screen projection by construction -- nothing left to
+      // drift.
       this.fixedWorldPivot = this.liveWorldPivot();
     }
   }
@@ -1794,7 +1835,14 @@ export class Runtime {
     // positions -- see finalizePivotSwitch's own comment for why it can't
     // wait until the rotateFromWorldCenter block further down without
     // lagging a frame behind.
-    if (this.pivotSwitchPending && !this.transitionManager.hasPending()) {
+    //
+    // Also gated on !panMomentumActive: an inertial/elastic pan-back-into-
+    // bounds animation drives `target` through per-frame zero-duration
+    // transitions, so transitionManager.hasPending() alone is back to false
+    // within the same frame it's set and can't be used, on its own, to tell
+    // whether that animation is still running -- see panMomentumActive's own
+    // comment.
+    if (this.pivotSwitchPending && !this.transitionManager.hasPending() && !this.panMomentumActive) {
       this.finalizePivotSwitch();
     }
 
