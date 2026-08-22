@@ -475,7 +475,6 @@ const reconciler = Reconciler
 
       detachDeletedInstance(node) {
         // no-op?
-        // console.log('detachDeletedInstance', node);
       },
 
       afterActiveInstanceBlur() {

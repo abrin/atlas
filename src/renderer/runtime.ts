@@ -1134,16 +1134,6 @@ export class Runtime {
     this.target[3] = this.target[1] + (this.target[3] - this.target[1]) * widthRatio;
     this.target[4] = this.target[2] + (this.target[4] - this.target[2]) * heightRatio;
 
-    // console.log('resize -> ', toBox(this.target), toBox(this.focalPosition));
-    // 1st bad case
-    // 1302 738 500 500
-    // {x: 0, y: -352.8966979980469, width: 580.4239501953125, height: 1729.7934265136719}
-    // {x: 0, y: 0.0000152587890625, width: 1024, height: 1023.9999847412109}
-    // 2nd bad case
-    // 738 295.9891062144095 500 500
-    // {x: 0, y: 0, width: 295.9891052246094, height: 500}
-    // {x: 119, y: 0, width: 500, height: 500}
-
     this.goHome({ position: this.focalPosition });
     this.renderer.resize(toWidth, toHeight);
     this.pendingUpdate = true;
@@ -1159,21 +1149,6 @@ export class Runtime {
 
       const marginTrimWidth = 0;
       const marginTrimHeight = 0;
-
-      // console.log(widthDiff, heightDiff);
-      // @todo An way to trim margins - breaks reversible resizing.
-      // if (
-      //   (widthDiff || widthDiff === 0) &&
-      //   this.x + this.width > this.world.width &&
-      //   (heightDiff || heightDiff === 0) &&
-      //   this.y + this.height > this.world.height
-      // ) {
-      //   // const maxMarginW = this.width - this.world.width;
-      //   // marginTrimWidth = (maxMarginW < widthDiff ? maxMarginW : widthDiff) * 2;
-      //   // const maxMarginH = this.height - this.world.height;
-      //   // marginTrimHeight = maxMarginH < heightDiff ? maxMarginH : heightDiff;
-      //   // console.log('A');
-      // }
 
       const baseX = this.x + marginTrimWidth;
       const baseY = this.y + marginTrimHeight;
