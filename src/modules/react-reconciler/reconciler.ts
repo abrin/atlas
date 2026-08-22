@@ -560,8 +560,11 @@ const reconciler = Reconciler
   : null;
 
 if (reconciler) {
-  // @ts-expect-error DefinitelyTyped is not up to date
-  reconciler.injectIntoDevTools();
+  reconciler.injectIntoDevTools({
+    bundleType: process.env.NODE_ENV === 'production' ? 0 : 1,
+    rendererPackageName: '@atlas-viewer/atlas',
+    version,
+  });
 }
 
 export function unmountComponentAtNode(runtime: Runtime, callback?: (runtime: any) => void) {
